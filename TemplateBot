@@ -1,0 +1,251 @@
+import asyncio
+import logging
+import os
+
+import requests
+
+from aiogram import Bot, Dispatcher, types
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters import Text
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.types import ParseMode
+from aiogram.utils import executor
+import tracemalloc
+
+tracemalloc.start()
+
+logging.basicConfig(level=logging.INFO)
+
+GRAFANA_URL = "GRAFANAURL"
+GRAFANA_API_KEY = "GRAFANA_APIKEY"
+
+bot = Bot(token="TELEGRAMBOT")
+dp = Dispatcher(bot, storage=MemoryStorage())
+
+class DashboardStates(StatesGroup):
+    dashboard = State()
+    panel = State()
+    timeframe = State()
+
+@dp.message_handler(commands=["start"])
+async def start(message: types.Message):
+    await message.answer(
+        "Hello! I am a bot for sending screenshots of panels from Grafana.\n"
+        "Enter the command /dashboard and select the dashboard you want to take a screenshot."
+    )
+
+async def get_dashboard_uid_by_name(dashboard_name: str):
+    # Get dashboard uid by its name
+    response = requests.get(f"{GRAFANA_URL}/api/search?query={dashboard_name}", verify=False, headers={"Authorization": f"Bearer {GRAFANA_API_KEY}"})
+    if response.status_code == 200:
+        for item in response.json():
+            if item["type"] == "dash-db" and item["title"] == dashboard_name:
+                return item["uid"]
+    return None
+
+@dp.message_handler(commands=["dashboard"])
+async def dashboard_command(message: types.Message, state: FSMContext):
+    try:
+        # Getting a list of available dashboards from Grafana
+        response = requests.get(f"{GRAFANA_URL}/api/search", verify=False, headers={"Authorization": f"Bearer {GRAFANA_API_KEY}"})
+        if response.status_code != 200:
+            await message.answer("Failed to get list of dashboards")
+            return
+        dashboards = []
+        for item in response.json():
+            if item["type"] == "dash-db":
+                dashboards.append(item["title"])
+
+        # We send a list of available dashboards and offer to choose one of them
+        if dashboards:
+            await message.answer(
+                "Select the dashboard you want to take a screenshot:",
+                reply_markup=await get_dashboard_keyboard(await state.get_data()),
+            )
+            await DashboardStates.dashboard.set()
+        else:
+            await message.answer("No dashboards found in Grafana.")
+    except Exception as e:
+        logging.exception(f"Error in dashboard_command: {e}")
+        await message.answer("An error occurred while processing the request. try later.")
+
+async def get_dashboard_keyboard(dashboards):
+    # We form a keyboard with available dashboards
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    for dashboard in dashboards:
+        keyboard.add(types.KeyboardButton(dashboard))
+    return keyboard
+
+
+@dp.message_handler(state=DashboardStates.dashboard, content_types=types.ContentTypes.TEXT)
+async def dashboard_chosen(message: types.Message, state: FSMContext):
+    # Save the selected dashboard in user state
+    await state.update_data(dashboard=message.text)
+    # Getting information about the selected dashboard
+    data = await state.get_data()
+    dashboard_uid = await get_dashboard_uid_by_name(data['dashboard'])
+    await state.update_data(dashboard_uid=dashboard_uid)
+    response = requests.get(f"{GRAFANA_URL}/api/dashboards/uid/{dashboard_uid}", headers={"Authorization": f"Bearer {GRAFANA_API_KEY}"})
+    if response.status_code != 200:
+        await message.answer("Failed to get dashboard information.")
+        return
+
+    dashboard_json = response.json()["dashboard"]
+    panels = []
+    for panel in dashboard_json["panels"]:
+        if panel["type"] != "row":
+            panels.append(panel["title"])
+
+    if panels:
+        await message.answer(
+            f"Dashboard selected '{data['dashboard']}'.\n"
+            "Select the panel you want to take a screenshot:",
+            reply_markup=await get_panel_keyboard(panels),
+        )
+        await DashboardStates.panel.set()
+    else:
+        await message.answer(f"On the dashboard '{data['dashboard']}' no panel found.")
+        await state.finish()
+
+async def get_panel_keyboard(panels):
+    # Forming a keyboard with available panels
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    for panel in panels:
+        keyboard.add(panel)
+    keyboard.add(types.KeyboardButton("Back"))
+    return keyboard
+
+@dp.message_handler(state=DashboardStates.panel, content_types=types.ContentTypes.TEXT)
+async def panel_chosen(message: types.Message, state: FSMContext):
+    if message.text == "Back":
+        await message.answer("Choose a dashboard:", reply_markup=await get_dashboard_keyboard(await state.get_data()))
+        await DashboardStates.dashboard.set()
+        return
+
+    # Save the selected panel in user state
+    await state.update_data(panel=message.text)
+
+    # We suggest choosing a time interval
+    await message.answer("Select the time interval for which you want to take a screenshot:",
+                         reply_markup=await get_timeframe_keyboard(),
+                         )
+    await DashboardStates.timeframe.set()
+    
+async def get_dashboard_keyboard(data):
+    # We form a keyboard with available dashboards
+    response = requests.get(f"{GRAFANA_URL}/api/search", verify=False, headers={"Authorization": f"Bearer {GRAFANA_API_KEY}"})
+    if response.status_code != 200:
+        raise ValueError("Failed to get list of dashboards.")
+    dashboards = []
+    for item in response.json():
+        if item["type"] == "dash-db":
+            dashboards.append(item["title"])
+
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    for dashboard in dashboards:
+        keyboard.add(types.KeyboardButton(dashboard))
+    keyboard.add(types.KeyboardButton("Back"))
+    return keyboard
+
+async def get_timeframe_keyboard():
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.row(types.InlineKeyboardButton("Today", callback_data="today"))
+    keyboard.row(types.InlineKeyboardButton("Yesterday", callback_data="yesterday"))
+    keyboard.row(
+        types.InlineKeyboardButton("For the last hour", callback_data="last_hour"),
+        types.InlineKeyboardButton("Last 24 hours", callback_data="last_24_hours"),
+    )
+    keyboard.row(
+        types.InlineKeyboardButton("For the last week", callback_data="last_week"),
+        types.InlineKeyboardButton("For the last month", callback_data="last_month"),
+    )
+    return keyboard
+
+@dp.callback_query_handler(state=DashboardStates.timeframe)
+async def timeframe_chosen(callback_query: types.CallbackQuery, state: FSMContext):
+    # Save the selected time interval in the user state
+    await state.update_data(timeframe=callback_query.data)
+    data = await state.get_data()
+
+    # Getting information about the selected dashboard
+    dashboard_uid = await get_dashboard_uid_by_name(data['dashboard'])
+    response = requests.get(f"{GRAFANA_URL}/api/dashboards/uid/{dashboard_uid}", headers={"Authorization": f"Bearer {GRAFANA_API_KEY}"})
+    if response.status_code != 200:
+        await callback_query.answer("Failed to get dashboard information.")
+        await state.finish()
+
+    dashboard_json = response.json()["dashboard"]
+
+    # Forming a URL to get a screenshot of the selected panel
+    panel_ids = [panel["id"] for panel in dashboard_json["panels"] if panel["title"] == data["panel"]]
+    if not panel_ids:
+        await callback_query.answer(f"On the dashboard '{data['dashboard']}' panel not found '{data['panel']}'")
+        await state.finish()
+        return  # Error: Function terminates too soon. You need to remove the return line.
+
+    panel_id = panel_ids[0]
+
+    response = requests.get(
+        f"{GRAFANA_URL}/render/d-solo/{dashboard_uid}/?orgId=4&panelId={panel_id}&from={get_timeframe_start(data['timeframe'])}&to={get_timeframe_end(data['timeframe'])}&width=1000&height=500&tz=Europe%2FMoscow",
+        headers={"Authorization": f"Bearer {GRAFANA_API_KEY}"},
+    )
+
+    if response.status_code != 200:
+        await callback_query.answer("Failed to get panel screenshot.")
+        await state.finish()
+        return  # Error: Function terminates too soon. You need to remove the return line.
+
+    # Sending a screenshot of the panel to the user
+    with open("panel.png", "wb") as f:
+        f.write(response.content)
+
+    panel_text = f"Panel screenshot sent '{data['panel']}' for the time period '{data['timeframe']}'"
+    with open("panel.png", "rb") as f:
+        await bot.send_photo(callback_query.from_user.id, f, caption=panel_text)
+
+    # End user state
+    await state.finish()
+
+    # Back to the list of available dashboards
+    await callback_query.message.answer(
+        "Choose a dashboard:",
+        reply_markup=await get_dashboard_keyboard(await state.get_data()),
+    )
+    await DashboardStates.dashboard.set()
+    
+def get_timeframe_start(timeframe):
+    if timeframe == "today":
+        return "now/d"
+    elif timeframe == "yesterday":
+        return "now-1d/d"
+    elif timeframe == "last_hour":
+        return "now-1h"
+    elif timeframe == "last_24_hours":
+        return "now-24h"
+    elif timeframe == "last_week":
+        return "now-7d"
+    elif timeframe == "last_month":
+        return "now-30d"
+    else:
+        return ""
+
+def get_timeframe_end(timeframe):
+    if timeframe == "today":
+        return "now"
+    elif timeframe == "yesterday":
+        return "now/d"
+    elif timeframe == "last_hour":
+        return "now/d"
+    elif timeframe == "last_24_hours":
+        return "now"
+    elif timeframe == "last_week":
+        return "now"
+    elif timeframe == "last_month":
+        return "now"
+    else:
+        return ""
+            
+if __name__ == "__main__":
+    executor.start_polling(dp, skip_updates=True)
+
